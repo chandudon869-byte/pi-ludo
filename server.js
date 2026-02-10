@@ -29,7 +29,101 @@ console.log('Ludo Server starting...');
 // Game state storage
 const rooms = {};
 const MAX_PLAYERS = 4;
+const DEFAULT_MAX_PLAYERS = 4;
 const TURN_TIME_MS = 10000;
+const quickPlayQueue = [];
+
+function removeFromQuickPlayQueue(socketId) {
+  const idx = quickPlayQueue.indexOf(socketId);
+  if (idx !== -1) {
+    quickPlayQueue.splice(idx, 1);
+  }
+}
+
+function emitQuickPlayQueueUpdate() {
+  const payload = { count: quickPlayQueue.length, maxPlayers: DEFAULT_MAX_PLAYERS };
+  quickPlayQueue.forEach(id => {
+    const s = io.sockets.sockets.get(id);
+    if (s) {
+      s.emit('quick_play_queue_update', payload);
+    }
+  });
+}
+
+function createQuickPlayRoom() {
+  const playersToMatch = [];
+  while (playersToMatch.length < DEFAULT_MAX_PLAYERS && quickPlayQueue.length > 0) {
+    const id = quickPlayQueue.shift();
+    const s = io.sockets.sockets.get(id);
+    if (s) {
+      playersToMatch.push(s);
+    }
+  }
+
+  if (playersToMatch.length < DEFAULT_MAX_PLAYERS) {
+    // Not enough valid sockets, put them back and update queue
+    playersToMatch.forEach(s => quickPlayQueue.unshift(s.id));
+    emitQuickPlayQueueUpdate();
+    return;
+  }
+
+  const roomId = generateRoomCode();
+  rooms[roomId] = {
+    players: {},
+    playerCount: 0,
+    maxPlayers: DEFAULT_MAX_PLAYERS,
+    isPublic: false,
+    gameState: {
+      players: {},
+      playerColors: {},
+      currentPlayer: null,
+      diceValue: 0,
+      gameStarted: false,
+      settings: {},
+      tokens: {
+        r: [-1, -1, -1, -1],
+        g: [-1, -1, -1, -1],
+        y: [-1, -1, -1, -1],
+        b: [-1, -1, -1, -1]
+      }
+    },
+    createdAt: new Date().toISOString()
+  };
+
+  playersToMatch.forEach((s, idx) => {
+    const isHost = idx === 0;
+    const name = s.data?.playerName || `Player${Object.keys(rooms[roomId].players).length + 1}`;
+    rooms[roomId].players[s.id] = {
+      id: s.id,
+      name,
+      isHost,
+      ready: true,
+      color: null,
+      joinedAt: new Date().toISOString()
+    };
+    rooms[roomId].playerCount++;
+    rooms[roomId].gameState.players[s.id] = { name, ready: true };
+    s.join(roomId);
+  });
+
+  const payload = {
+    roomId,
+    players: rooms[roomId].players,
+    playerCount: rooms[roomId].playerCount,
+    maxPlayers: rooms[roomId].maxPlayers,
+    isPublic: rooms[roomId].isPublic
+  };
+
+  playersToMatch.forEach((s, idx) => {
+    if (idx === 0) {
+      s.emit('room_created', { ...payload, isHost: true });
+    } else {
+      s.emit('room_joined', { ...payload, isHost: false });
+    }
+  });
+
+  emitQuickPlayQueueUpdate();
+}
 
 function clearTurnTimer(room) {
   if (room && room.gameState && room.gameState.turnTimer) {
@@ -84,10 +178,17 @@ function getValidMoves(room, color, diceValue) {
     if (step === -1 && diceValue === 6) {
       moves.push(idx);
     } else if (step !== -1 && step + diceValue <= 56) {
+      if (requiresCutToHome(room) && step <= 50 && step + diceValue > 50) {
+        if (!room.gameState.cutStatus || !room.gameState.cutStatus[color]) return;
+      }
       moves.push(idx);
     }
   });
   return moves;
+}
+
+function requiresCutToHome(room) {
+  return room?.gameState?.settings?.cutToHome === true;
 }
 
 function passTurn(roomId, playerColor) {
@@ -127,6 +228,11 @@ function applyMove(roomId, color, tokenIndex, diceValue, actorId) {
     newStep = 0;
   } else if (currentStep !== -1 && currentStep + diceValue <= 56) {
     newStep = currentStep + diceValue;
+    if (requiresCutToHome(room) && currentStep <= 50 && newStep > 50) {
+      if (!room.gameState.cutStatus || !room.gameState.cutStatus[color]) {
+        return;
+      }
+    }
     if (newStep <= 50) {
       const targetIdx = (START_INDEX[color] + newStep) % 52;
       if (!SAFE_ZONES.includes(targetIdx)) {
@@ -148,6 +254,13 @@ function applyMove(roomId, color, tokenIndex, diceValue, actorId) {
     }
   } else {
     return;
+  }
+
+  if (killOccurred) {
+    if (!room.gameState.cutStatus) {
+      room.gameState.cutStatus = { r: false, g: false, y: false, b: false };
+    }
+    room.gameState.cutStatus[color] = true;
   }
 
   room.gameState.tokens[color][tokenIndex] = newStep;
@@ -213,6 +326,7 @@ function buildPublicRoomsList() {
         id: roomId,
         hostName: host?.name || 'Host',
         playerCount: room.playerCount || 0,
+        maxPlayers: room.maxPlayers || MAX_PLAYERS,
         gameStarted: !!room.gameState?.gameStarted
       };
     });
@@ -239,8 +353,33 @@ function isSafePosition(color, step) {
   return SAFE_ZONES.includes(idx);
 }
 
+function getPairedColor(color) {
+  const pairs = { r: 'y', y: 'r', g: 'b', b: 'g' };
+  return pairs[color];
+}
+
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
+
+  socket.on('quick_play_join', (data = {}) => {
+    const playerName = data.playerName || `Player${Math.floor(Math.random() * 1000)}`;
+    socket.data = socket.data || {};
+    socket.data.playerName = playerName;
+
+    if (!quickPlayQueue.includes(socket.id)) {
+      quickPlayQueue.push(socket.id);
+    }
+
+    emitQuickPlayQueueUpdate();
+    if (quickPlayQueue.length >= DEFAULT_MAX_PLAYERS) {
+      createQuickPlayRoom();
+    }
+  });
+
+  socket.on('quick_play_cancel', () => {
+    removeFromQuickPlayQueue(socket.id);
+    emitQuickPlayQueueUpdate();
+  });
 
   socket.on('no_move_possible', (data) => {
     const { roomId, playerColor } = data;
@@ -285,6 +424,7 @@ io.on('connection', (socket) => {
           }
         },
         playerCount: 1,
+        maxPlayers: DEFAULT_MAX_PLAYERS,
         isPublic: !!isPublic,
         gameState: {
           players: {},
@@ -314,6 +454,8 @@ io.on('connection', (socket) => {
         roomId,
         players: rooms[roomId].players,
         playerCount: 1,
+        maxPlayers: rooms[roomId].maxPlayers,
+        isPublic: rooms[roomId].isPublic,
         isHost: true
       });
 
@@ -341,8 +483,9 @@ io.on('connection', (socket) => {
         return;
       }
       
-      if (rooms[roomCode].playerCount >= MAX_PLAYERS) {
-        socket.emit('error', { message: 'Room is full (4/4 players)' });
+      const roomMax = rooms[roomCode].maxPlayers || MAX_PLAYERS;
+      if (rooms[roomCode].playerCount >= roomMax) {
+        socket.emit('error', { message: `Room is full (${roomMax}/${roomMax} players)` });
         return;
       }
       
@@ -376,6 +519,8 @@ io.on('connection', (socket) => {
         players: rooms[roomCode].players,
         playerCount: rooms[roomCode].playerCount,
         playerColors: rooms[roomCode].gameState.playerColors || {},
+        maxPlayers: rooms[roomCode].maxPlayers || MAX_PLAYERS,
+        isPublic: rooms[roomCode].isPublic,
         isHost: false
       });
       
@@ -384,10 +529,11 @@ io.on('connection', (socket) => {
         newPlayerId: socket.id,
         players: rooms[roomCode].players,
         playerCount: rooms[roomCode].playerCount,
-        playerColors: rooms[roomCode].gameState.playerColors || {}
+        playerColors: rooms[roomCode].gameState.playerColors || {},
+        maxPlayers: rooms[roomCode].maxPlayers || MAX_PLAYERS
       });
       
-      console.log(`${playerName} joined room ${roomCode} (${rooms[roomCode].playerCount}/4 players)`);
+      console.log(`${playerName} joined room ${roomCode} (${rooms[roomCode].playerCount}/${rooms[roomCode].maxPlayers || MAX_PLAYERS} players)`);
     } catch (error) {
       console.error('Error joining room:', error);
       socket.emit('error', { message: 'Failed to join room' });
@@ -408,6 +554,17 @@ io.on('connection', (socket) => {
       if (room.gameStarted) {
         socket.emit('error', { message: 'Game already started' });
         return;
+      }
+
+      if ((room.maxPlayers || MAX_PLAYERS) === 2) {
+        const selectedColors = Object.keys(room.gameState.playerColors || {});
+        if (selectedColors.length === 1) {
+          const required = getPairedColor(selectedColors[0]);
+          if (color !== required) {
+            socket.emit('error', { message: `Only ${required.toUpperCase()} is available in 2-player mode` });
+            return;
+          }
+        }
       }
       
       // Check if color is already taken
@@ -468,6 +625,92 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Toggle public/private (host only)
+  socket.on('set_public', (data) => {
+    try {
+      const { roomId, isPublic } = data;
+      const room = rooms[roomId];
+
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      const host = Object.values(room.players).find(p => p.isHost);
+      if (!host || host.id !== socket.id) {
+        socket.emit('error', { message: 'Only host can change room visibility' });
+        return;
+      }
+
+      if (room.gameState?.gameStarted) {
+        socket.emit('error', { message: 'Game already started' });
+        return;
+      }
+
+      room.isPublic = !!isPublic;
+      io.to(roomId).emit('room_updated', {
+        roomId,
+        playerCount: room.playerCount,
+        maxPlayers: room.maxPlayers || MAX_PLAYERS,
+        isPublic: room.isPublic
+      });
+
+      io.emit('public_rooms_list', { rooms: buildPublicRoomsList() });
+    } catch (error) {
+      console.error('Error setting room public:', error);
+      socket.emit('error', { message: 'Failed to update room visibility' });
+    }
+  });
+
+  // Set max players (host only)
+  socket.on('set_max_players', (data) => {
+    try {
+      const { roomId, maxPlayers } = data;
+      const room = rooms[roomId];
+
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      const host = Object.values(room.players).find(p => p.isHost);
+      if (!host || host.id !== socket.id) {
+        socket.emit('error', { message: 'Only host can change max players' });
+        return;
+      }
+
+      if (room.gameState?.gameStarted) {
+        socket.emit('error', { message: 'Game already started' });
+        return;
+      }
+
+      const nextMax = parseInt(maxPlayers, 10);
+      if (![2, 4].includes(nextMax)) {
+        socket.emit('error', { message: 'Invalid max players' });
+        return;
+      }
+
+      if (room.playerCount > nextMax) {
+        socket.emit('error', { message: `Too many players for ${nextMax}-player room` });
+        return;
+      }
+
+      room.maxPlayers = nextMax;
+      io.to(roomId).emit('room_updated', {
+        roomId,
+        playerCount: room.playerCount,
+        maxPlayers: room.maxPlayers
+      });
+
+      if (room.isPublic) {
+        io.emit('public_rooms_list', { rooms: buildPublicRoomsList() });
+      }
+    } catch (error) {
+      console.error('Error setting max players:', error);
+      socket.emit('error', { message: 'Failed to set max players' });
+    }
+  });
+
   // Get public rooms
   socket.on('get_public_rooms', () => {
     try {
@@ -510,7 +753,16 @@ io.on('connection', (socket) => {
 
       if (playersWithoutColors.length > 0) {
         for (const player of playersWithoutColors) {
-          const freeColor = colors.find(c => !usedColors.has(c));
+          let freeColor = colors.find(c => !usedColors.has(c));
+
+          if ((room.maxPlayers || MAX_PLAYERS) === 2 && usedColors.size === 1) {
+            const existing = Array.from(usedColors)[0];
+            const paired = getPairedColor(existing);
+            if (paired && !usedColors.has(paired)) {
+              freeColor = paired;
+            }
+          }
+
           if (!freeColor) {
             socket.emit('error', { message: 'No available colors to assign' });
             return;
@@ -531,6 +783,7 @@ io.on('connection', (socket) => {
       room.gameState.gameStarted = true;
       room.isPublic = false;
       room.gameState.settings = settings || {};
+      room.gameState.cutStatus = { r: false, g: false, y: false, b: false };
       room.gameState.currentPlayer = finalSelectedColors[0];
       room.gameState.diceValue = 0;
       
@@ -590,6 +843,7 @@ io.on('connection', (socket) => {
       room.gameState.gameStarted = true;
       room.gameState.diceValue = 0;
       room.gameState.currentPlayer = selectedColors[0];
+      room.gameState.cutStatus = { r: false, g: false, y: false, b: false };
       selectedColors.forEach(color => {
         room.gameState.tokens[color] = [-1, -1, -1, -1];
       });
@@ -737,6 +991,7 @@ io.on('connection', (socket) => {
             players: room.players,
             playerCount: room.playerCount,
             playerColors: room.gameState?.playerColors || {},
+            maxPlayers: room.maxPlayers || MAX_PLAYERS,
             newHost: room.players[Object.keys(room.players)[0]]?.id
           });
           console.log(`${playerName} left room ${roomId} (${room.playerCount} players remaining)`);
@@ -752,6 +1007,8 @@ io.on('connection', (socket) => {
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
+    removeFromQuickPlayQueue(socket.id);
+    emitQuickPlayQueueUpdate();
     
     // Find and clean up rooms this player was in
     Object.keys(rooms).forEach(roomId => {
@@ -796,6 +1053,7 @@ io.on('connection', (socket) => {
             players: room.players,
             playerCount: room.playerCount,
             playerColors: room.gameState?.playerColors || {},
+            maxPlayers: room.maxPlayers || MAX_PLAYERS,
             newHost: room.players[Object.keys(room.players)[0]]?.id
           });
           console.log(`${playerName} disconnected from room ${roomId} (${room.playerCount} players remaining)`);
