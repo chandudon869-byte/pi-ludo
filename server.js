@@ -31,18 +31,24 @@ const rooms = {};
 const MAX_PLAYERS = 4;
 const DEFAULT_MAX_PLAYERS = 4;
 const TURN_TIME_MS = 10000;
-const quickPlayQueue = [];
+const quickPlayQueues = {
+  2: [],
+  4: []
+};
 
 function removeFromQuickPlayQueue(socketId) {
-  const idx = quickPlayQueue.indexOf(socketId);
-  if (idx !== -1) {
-    quickPlayQueue.splice(idx, 1);
-  }
+  [2, 4].forEach(size => {
+    const idx = quickPlayQueues[size].indexOf(socketId);
+    if (idx !== -1) {
+      quickPlayQueues[size].splice(idx, 1);
+    }
+  });
 }
 
-function emitQuickPlayQueueUpdate() {
-  const payload = { count: quickPlayQueue.length, maxPlayers: DEFAULT_MAX_PLAYERS };
-  quickPlayQueue.forEach(id => {
+function emitQuickPlayQueueUpdate(queueSize) {
+  const queue = quickPlayQueues[queueSize] || [];
+  const payload = { count: queue.length, maxPlayers: queueSize };
+  queue.forEach(id => {
     const s = io.sockets.sockets.get(id);
     if (s) {
       s.emit('quick_play_queue_update', payload);
@@ -50,20 +56,22 @@ function emitQuickPlayQueueUpdate() {
   });
 }
 
-function createQuickPlayRoom() {
+function createQuickPlayRoom(queueSize) {
+  const size = [2, 4].includes(queueSize) ? queueSize : DEFAULT_MAX_PLAYERS;
+  const queue = quickPlayQueues[size] || [];
   const playersToMatch = [];
-  while (playersToMatch.length < DEFAULT_MAX_PLAYERS && quickPlayQueue.length > 0) {
-    const id = quickPlayQueue.shift();
+  while (playersToMatch.length < size && queue.length > 0) {
+    const id = queue.shift();
     const s = io.sockets.sockets.get(id);
     if (s) {
       playersToMatch.push(s);
     }
   }
 
-  if (playersToMatch.length < DEFAULT_MAX_PLAYERS) {
+  if (playersToMatch.length < size) {
     // Not enough valid sockets, put them back and update queue
-    playersToMatch.forEach(s => quickPlayQueue.unshift(s.id));
-    emitQuickPlayQueueUpdate();
+    playersToMatch.forEach(s => queue.unshift(s.id));
+    emitQuickPlayQueueUpdate(size);
     return;
   }
 
@@ -71,7 +79,7 @@ function createQuickPlayRoom() {
   rooms[roomId] = {
     players: {},
     playerCount: 0,
-    maxPlayers: DEFAULT_MAX_PLAYERS,
+    maxPlayers: size,
     isPublic: false,
     gameState: {
       players: {},
@@ -122,7 +130,7 @@ function createQuickPlayRoom() {
     }
   });
 
-  emitQuickPlayQueueUpdate();
+  emitQuickPlayQueueUpdate(size);
 }
 
 function clearTurnTimer(room) {
@@ -363,22 +371,26 @@ io.on('connection', (socket) => {
 
   socket.on('quick_play_join', (data = {}) => {
     const playerName = data.playerName || `Player${Math.floor(Math.random() * 1000)}`;
+    const maxPlayers = [2, 4].includes(parseInt(data.maxPlayers, 10)) ? parseInt(data.maxPlayers, 10) : DEFAULT_MAX_PLAYERS;
     socket.data = socket.data || {};
     socket.data.playerName = playerName;
 
-    if (!quickPlayQueue.includes(socket.id)) {
-      quickPlayQueue.push(socket.id);
+    removeFromQuickPlayQueue(socket.id);
+    const queue = quickPlayQueues[maxPlayers];
+    if (queue && !queue.includes(socket.id)) {
+      queue.push(socket.id);
     }
 
-    emitQuickPlayQueueUpdate();
-    if (quickPlayQueue.length >= DEFAULT_MAX_PLAYERS) {
-      createQuickPlayRoom();
+    emitQuickPlayQueueUpdate(maxPlayers);
+    if (queue.length >= maxPlayers) {
+      createQuickPlayRoom(maxPlayers);
     }
   });
 
   socket.on('quick_play_cancel', () => {
     removeFromQuickPlayQueue(socket.id);
-    emitQuickPlayQueueUpdate();
+    emitQuickPlayQueueUpdate(2);
+    emitQuickPlayQueueUpdate(4);
   });
 
   socket.on('no_move_possible', (data) => {
@@ -1008,7 +1020,8 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
     removeFromQuickPlayQueue(socket.id);
-    emitQuickPlayQueueUpdate();
+    emitQuickPlayQueueUpdate(2);
+    emitQuickPlayQueueUpdate(4);
     
     // Find and clean up rooms this player was in
     Object.keys(rooms).forEach(roomId => {
