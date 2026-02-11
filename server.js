@@ -31,10 +31,90 @@ const rooms = {};
 const MAX_PLAYERS = 4;
 const DEFAULT_MAX_PLAYERS = 4;
 const TURN_TIME_MS = 10000;
+const RECONNECT_GRACE_MS = 60000;
 const quickPlayQueues = {
   2: [],
   4: []
 };
+
+function replacePlayerIdInRoom(room, oldId, newId) {
+  if (!room || !room.players || !room.players[oldId]) return null;
+  const existing = room.players[oldId];
+  room.players[newId] = {
+    ...existing,
+    id: newId,
+    connected: true,
+    disconnectedAt: null,
+    lastReconnectAt: new Date().toISOString()
+  };
+  delete room.players[oldId];
+
+  if (room.gameState?.players?.[oldId]) {
+    room.gameState.players[newId] = room.gameState.players[oldId];
+    delete room.gameState.players[oldId];
+  }
+
+  if (room.gameState?.playerColors) {
+    Object.keys(room.gameState.playerColors).forEach(color => {
+      if (room.gameState.playerColors[color] === oldId) {
+        room.gameState.playerColors[color] = newId;
+      }
+    });
+  }
+
+  return room.players[newId];
+}
+
+function removePlayerFromRoom(roomId, playerId, reason = "left") {
+  const room = rooms[roomId];
+  if (!room || !room.players[playerId]) return;
+
+  const leavingPlayer = room.players[playerId];
+  const playerName = leavingPlayer?.name || "Player";
+  const leavingWasHost = !!leavingPlayer?.isHost;
+
+  delete room.players[playerId];
+  room.playerCount--;
+
+  if (room.gameState?.players?.[playerId]) {
+    delete room.gameState.players[playerId];
+  }
+
+  if (room.gameState?.playerColors) {
+    Object.keys(room.gameState.playerColors).forEach(color => {
+      if (room.gameState.playerColors[color] === playerId) {
+        delete room.gameState.playerColors[color];
+      }
+    });
+  }
+
+  if (leavingWasHost && room.playerCount > 0) {
+    Object.values(room.players).forEach(p => {
+      p.isHost = false;
+    });
+    const newHostId = Object.keys(room.players)[0];
+    if (newHostId) {
+      room.players[newHostId].isHost = true;
+    }
+  }
+
+  if (room.playerCount === 0) {
+    delete rooms[roomId];
+    console.log(`Room ${roomId} deleted (empty)`);
+  } else {
+    io.to(roomId).emit("player_left", {
+      leftPlayerId: playerId,
+      leftPlayerName: playerName,
+      players: room.players,
+      playerCount: room.playerCount,
+      playerColors: room.gameState?.playerColors || {},
+      maxPlayers: room.maxPlayers || MAX_PLAYERS,
+      newHost: room.players[Object.keys(room.players)[0]]?.id,
+      reason
+    });
+    console.log(`${playerName} removed from room ${roomId} (${room.playerCount} players remaining)`);
+  }
+}
 
 function removeFromQuickPlayQueue(socketId) {
   [2, 4].forEach(size => {
@@ -48,6 +128,7 @@ function removeFromQuickPlayQueue(socketId) {
 function emitQuickPlayQueueUpdate(queueSize) {
   const queue = quickPlayQueues[queueSize] || [];
   const payload = { count: queue.length, maxPlayers: queueSize };
+  console.log(`[QP] Queue ${queueSize}: ${queue.length} waiting`);
   queue.forEach(id => {
     const s = io.sockets.sockets.get(id);
     if (s) {
@@ -59,6 +140,7 @@ function emitQuickPlayQueueUpdate(queueSize) {
 function createQuickPlayRoom(queueSize) {
   const size = [2, 4].includes(queueSize) ? queueSize : DEFAULT_MAX_PLAYERS;
   const queue = quickPlayQueues[size] || [];
+  console.log(`[QP] Attempting match for ${size}. Queue size: ${queue.length}`);
   const playersToMatch = [];
   while (playersToMatch.length < size && queue.length > 0) {
     const id = queue.shift();
@@ -76,6 +158,7 @@ function createQuickPlayRoom(queueSize) {
   }
 
   const roomId = generateRoomCode();
+  console.log(`[QP] Creating room ${roomId} for ${playersToMatch.length} players (target ${size})`);
   rooms[roomId] = {
     players: {},
     playerCount: 0,
@@ -101,9 +184,11 @@ function createQuickPlayRoom(queueSize) {
   playersToMatch.forEach((s, idx) => {
     const isHost = idx === 0;
     const name = s.data?.playerName || `Player${Object.keys(rooms[roomId].players).length + 1}`;
+    const avatar = s.data?.playerAvatar || null;
     rooms[roomId].players[s.id] = {
       id: s.id,
       name,
+      avatar,
       isHost,
       ready: true,
       color: null,
@@ -372,8 +457,10 @@ io.on('connection', (socket) => {
   socket.on('quick_play_join', (data = {}) => {
     const playerName = data.playerName || `Player${Math.floor(Math.random() * 1000)}`;
     const maxPlayers = [2, 4].includes(parseInt(data.maxPlayers, 10)) ? parseInt(data.maxPlayers, 10) : DEFAULT_MAX_PLAYERS;
+    const avatar = data.avatar || null;
     socket.data = socket.data || {};
     socket.data.playerName = playerName;
+    socket.data.playerAvatar = avatar;
 
     removeFromQuickPlayQueue(socket.id);
     const queue = quickPlayQueues[maxPlayers];
@@ -381,6 +468,7 @@ io.on('connection', (socket) => {
       queue.push(socket.id);
     }
 
+    console.log(`[QP] ${playerName} (${socket.id}) joined queue ${maxPlayers}. Now ${queue?.length || 0}`);
     emitQuickPlayQueueUpdate(maxPlayers);
     if (queue.length >= maxPlayers) {
       createQuickPlayRoom(maxPlayers);
@@ -421,7 +509,7 @@ io.on('connection', (socket) => {
   // Create a new room
   socket.on('create_room', (data) => {
     try {
-      const { playerName, isPublic } = data;
+      const { playerName, isPublic, avatar } = data;
       const roomId = generateRoomCode();
       
       rooms[roomId] = {
@@ -429,6 +517,7 @@ io.on('connection', (socket) => {
           [socket.id]: {
             id: socket.id,
             name: playerName || `Player${Object.keys(rooms).length + 1}`,
+            avatar: avatar || null,
             isHost: true,
             ready: true,
             color: null,
@@ -485,7 +574,7 @@ io.on('connection', (socket) => {
   // Join an existing room
   socket.on('join_room', (data) => {
     try {
-      const { roomId, playerName } = data;
+      const { roomId, playerName, avatar } = data;
       const roomCode = roomId.toUpperCase();
       
       console.log(`Join request for room: ${roomCode} by ${playerName}`);
@@ -511,6 +600,7 @@ io.on('connection', (socket) => {
       rooms[roomCode].players[socket.id] = {
         id: socket.id,
         name: playerName || `Player${rooms[roomCode].playerCount + 1}`,
+        avatar: avatar || null,
         isHost: false,
         ready: true,
         color: null,
