@@ -43,6 +43,7 @@ const quickPlayQueues = {
   2: [],
   4: []
 };
+const socketToPlayerUid = {};
 
 function replacePlayerIdInRoom(room, oldId, newId) {
   if (!room || !room.players || !room.players[oldId]) return null;
@@ -99,7 +100,8 @@ function removePlayerFromRoom(roomId, playerId, reason = "left") {
     Object.values(room.players).forEach(p => {
       p.isHost = false;
     });
-    const newHostId = Object.keys(room.players)[0];
+    const connectedHost = Object.keys(room.players).find(id => room.players[id]?.connected !== false);
+    const newHostId = connectedHost || Object.keys(room.players)[0];
     if (newHostId) {
       room.players[newHostId].isHost = true;
     }
@@ -116,7 +118,7 @@ function removePlayerFromRoom(roomId, playerId, reason = "left") {
       playerCount: room.playerCount,
       playerColors: room.gameState?.playerColors || {},
       maxPlayers: room.maxPlayers || MAX_PLAYERS,
-      newHost: room.players[Object.keys(room.players)[0]]?.id,
+      newHost: (Object.values(room.players).find(p => p?.isHost) || {}).id,
       reason
     });
     console.log(`${playerName} removed from room ${roomId} (${room.playerCount} players remaining)`);
@@ -130,6 +132,30 @@ function removeFromQuickPlayQueue(socketId) {
       quickPlayQueues[size].splice(idx, 1);
     }
   });
+}
+
+function getSocketPlayerUid(socket, data = {}) {
+  return (
+    data.playerUid ||
+    socket?.handshake?.auth?.playerUid ||
+    socket?.data?.playerUid ||
+    null
+  );
+}
+
+function findRoomPlayerByUid(playerUid, preferredRoomId = null) {
+  if (!playerUid) return null;
+  const roomIds = preferredRoomId ? [preferredRoomId] : Object.keys(rooms);
+  for (const roomId of roomIds) {
+    const room = rooms[roomId];
+    if (!room?.players) continue;
+    for (const [sid, p] of Object.entries(room.players)) {
+      if (p?.playerUid === playerUid) {
+        return { roomId, socketId: sid, player: p, room };
+      }
+    }
+  }
+  return null;
 }
 
 function emitQuickPlayQueueUpdate(queueSize) {
@@ -194,11 +220,14 @@ function createQuickPlayRoom(queueSize) {
     const avatar = s.data?.playerAvatar || null;
     rooms[roomId].players[s.id] = {
       id: s.id,
+      playerUid: s.data?.playerUid || socketToPlayerUid[s.id] || null,
       name,
       avatar,
       isHost,
       ready: true,
       color: null,
+      connected: true,
+      disconnectedAt: null,
       joinedAt: new Date().toISOString()
     };
     rooms[roomId].playerCount++;
@@ -460,14 +489,106 @@ function getPairedColor(color) {
 
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
+  const authPlayerUid = getSocketPlayerUid(socket);
+  if (authPlayerUid) {
+    socket.data = socket.data || {};
+    socket.data.playerUid = authPlayerUid;
+    socketToPlayerUid[socket.id] = authPlayerUid;
+  }
+
+  socket.on('reconnect_player', (data = {}) => {
+    try {
+      const playerUid = getSocketPlayerUid(socket, data);
+      const roomId = (data.roomId || '').toUpperCase();
+      if (!playerUid || !roomId) {
+        socket.emit('reconnect_failed', { message: 'Missing reconnect identity' });
+        return;
+      }
+
+      const found = findRoomPlayerByUid(playerUid, roomId);
+      if (!found) {
+        socket.emit('reconnect_failed', { message: 'No reconnect session found' });
+        return;
+      }
+
+      const room = found.room;
+      const oldSocketId = found.socketId;
+      const player = found.player;
+      const disconnectedAt = player?.disconnectedAt ? new Date(player.disconnectedAt).getTime() : null;
+      const now = Date.now();
+      if (disconnectedAt && now - disconnectedAt > RECONNECT_GRACE_MS) {
+        socket.emit('reconnect_failed', { message: 'Reconnect window expired' });
+        return;
+      }
+
+      // Replace socket id everywhere in room state
+      if (oldSocketId !== socket.id) {
+        replacePlayerIdInRoom(room, oldSocketId, socket.id);
+      } else if (room.players[socket.id]) {
+        room.players[socket.id].connected = true;
+        room.players[socket.id].disconnectedAt = null;
+      }
+
+      socket.data = socket.data || {};
+      socket.data.playerUid = playerUid;
+      socket.data.playerName = room.players[socket.id]?.name || socket.data.playerName;
+      socket.data.playerAvatar = room.players[socket.id]?.avatar || socket.data.playerAvatar;
+      socketToPlayerUid[socket.id] = playerUid;
+
+      removeFromQuickPlayQueue(oldSocketId);
+      removeFromQuickPlayQueue(socket.id);
+      socket.join(roomId);
+
+      socket.emit('reconnect_success', {
+        roomId,
+        playerId: socket.id,
+        players: room.players,
+        playerCount: room.playerCount,
+        playerColors: room.gameState?.playerColors || {},
+        maxPlayers: room.maxPlayers || MAX_PLAYERS,
+        isPublic: !!room.isPublic,
+        isHost: !!room.players[socket.id]?.isHost,
+        gameState: {
+          gameStarted: !!room.gameState?.gameStarted,
+          currentPlayer: room.gameState?.currentPlayer || null,
+          diceValue: room.gameState?.diceValue || 0,
+          settings: room.gameState?.settings || {},
+          cutStatus: room.gameState?.cutStatus || { r: false, g: false, y: false, b: false },
+          tokens: room.gameState?.tokens || {
+            r: [-1, -1, -1, -1],
+            g: [-1, -1, -1, -1],
+            y: [-1, -1, -1, -1],
+            b: [-1, -1, -1, -1]
+          }
+        }
+      });
+
+      socket.to(roomId).emit('player_reconnected', {
+        playerId: socket.id,
+        players: room.players,
+        playerCount: room.playerCount,
+        playerColors: room.gameState?.playerColors || {}
+      });
+
+      console.log(`Player ${room.players[socket.id]?.name || playerUid} reconnected in room ${roomId}`);
+    } catch (error) {
+      console.error('Error reconnecting player:', error);
+      socket.emit('reconnect_failed', { message: 'Failed to reconnect player' });
+    }
+  });
 
   socket.on('quick_play_join', (data = {}) => {
     const playerName = data.playerName || `Player${Math.floor(Math.random() * 1000)}`;
     const maxPlayers = [2, 4].includes(parseInt(data.maxPlayers, 10)) ? parseInt(data.maxPlayers, 10) : DEFAULT_MAX_PLAYERS;
     const avatar = data.avatar || null;
+    const playerUid = getSocketPlayerUid(socket, data);
     socket.data = socket.data || {};
     socket.data.playerName = playerName;
     socket.data.playerAvatar = avatar;
+    if (playerUid) {
+      socket.data.playerUid = playerUid;
+      socketToPlayerUid[socket.id] = playerUid;
+    }
 
     removeFromQuickPlayQueue(socket.id);
     const queue = quickPlayQueues[maxPlayers];
@@ -517,17 +638,26 @@ io.on('connection', (socket) => {
   socket.on('create_room', (data) => {
     try {
       const { playerName, isPublic, avatar } = data;
+      const playerUid = getSocketPlayerUid(socket, data);
+      if (playerUid) {
+        socket.data = socket.data || {};
+        socket.data.playerUid = playerUid;
+        socketToPlayerUid[socket.id] = playerUid;
+      }
       const roomId = generateRoomCode();
       
       rooms[roomId] = {
         players: {
           [socket.id]: {
             id: socket.id,
+            playerUid: playerUid || null,
             name: playerName || `Player${Object.keys(rooms).length + 1}`,
             avatar: avatar || null,
             isHost: true,
             ready: true,
             color: null,
+            connected: true,
+            disconnectedAt: null,
             joinedAt: new Date().toISOString()
           }
         },
@@ -582,6 +712,12 @@ io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
     try {
       const { roomId, playerName, avatar } = data;
+      const playerUid = getSocketPlayerUid(socket, data);
+      if (playerUid) {
+        socket.data = socket.data || {};
+        socket.data.playerUid = playerUid;
+        socketToPlayerUid[socket.id] = playerUid;
+      }
       const roomCode = roomId.toUpperCase();
       
       console.log(`Join request for room: ${roomCode} by ${playerName}`);
@@ -606,11 +742,14 @@ io.on('connection', (socket) => {
       // Add player to room
       rooms[roomCode].players[socket.id] = {
         id: socket.id,
+        playerUid: playerUid || null,
         name: playerName || `Player${rooms[roomCode].playerCount + 1}`,
         avatar: avatar || null,
         isHost: false,
         ready: true,
         color: null,
+        connected: true,
+        disconnectedAt: null,
         joinedAt: new Date().toISOString()
       };
       
@@ -1057,55 +1196,7 @@ io.on('connection', (socket) => {
   socket.on('leave_room', (data) => {
     try {
       const { roomId } = data;
-      const room = rooms[roomId];
-      
-      if (room) {
-        const leavingPlayer = room.players[socket.id];
-        const playerName = leavingPlayer?.name || 'Player';
-        const leavingWasHost = !!leavingPlayer?.isHost;
-        
-        // Remove player from room
-        delete room.players[socket.id];
-        room.playerCount--;
-        
-        // Remove player's color selection
-        if (room.gameState && room.gameState.playerColors) {
-          Object.keys(room.gameState.playerColors).forEach(color => {
-            if (room.gameState.playerColors[color] === socket.id) {
-              delete room.gameState.playerColors[color];
-            }
-          });
-        }
-        
-        // If host leaves, assign new host
-        if (leavingWasHost && room.playerCount > 0) {
-          Object.values(room.players).forEach(p => {
-            p.isHost = false;
-          });
-          const newHostId = Object.keys(room.players)[0];
-          if (newHostId) {
-            room.players[newHostId].isHost = true;
-          }
-        }
-        
-        // If room becomes empty, delete it
-        if (room.playerCount === 0) {
-          delete rooms[roomId];
-          console.log(`Room ${roomId} deleted (empty)`);
-        } else {
-          // Notify remaining players
-          socket.to(roomId).emit('player_left', {
-            leftPlayerId: socket.id,
-            leftPlayerName: playerName,
-            players: room.players,
-            playerCount: room.playerCount,
-            playerColors: room.gameState?.playerColors || {},
-            maxPlayers: room.maxPlayers || MAX_PLAYERS,
-            newHost: room.players[Object.keys(room.players)[0]]?.id
-          });
-          console.log(`${playerName} left room ${roomId} (${room.playerCount} players remaining)`);
-        }
-      }
+      removePlayerFromRoom(roomId, socket.id, "left");
       
       socket.leave(roomId);
     } catch (error) {
@@ -1119,57 +1210,26 @@ io.on('connection', (socket) => {
     removeFromQuickPlayQueue(socket.id);
     emitQuickPlayQueueUpdate(2);
     emitQuickPlayQueueUpdate(4);
-    
-    // Find and clean up rooms this player was in
+
+    // Mark disconnected; keep room spot for grace period.
     Object.keys(rooms).forEach(roomId => {
       const room = rooms[roomId];
-      if (room && room.players[socket.id]) {
-        const leavingPlayer = room.players[socket.id];
-        const playerName = leavingPlayer?.name || 'Player';
-        const leavingWasHost = !!leavingPlayer?.isHost;
-        
-        delete room.players[socket.id];
-        room.playerCount--;
-        
-        // Remove player's color selection
-        if (room.gameState && room.gameState.playerColors) {
-          Object.keys(room.gameState.playerColors).forEach(color => {
-            if (room.gameState.playerColors[color] === socket.id) {
-              delete room.gameState.playerColors[color];
-            }
-          });
-        }
-        
-        // If host leaves, assign new host
-        if (leavingWasHost && room.playerCount > 0) {
-          Object.values(room.players).forEach(p => {
-            p.isHost = false;
-          });
-          const newHostId = Object.keys(room.players)[0];
-          if (newHostId) {
-            room.players[newHostId].isHost = true;
-          }
-        }
-        
-        // If room becomes empty, delete it
-        if (room.playerCount === 0) {
-          delete rooms[roomId];
-          console.log(`Room ${roomId} deleted (empty after disconnect)`);
-        } else {
-          // Notify remaining players
-          io.to(roomId).emit('player_left', {
-            leftPlayerId: socket.id,
-            leftPlayerName: playerName,
-            players: room.players,
-            playerCount: room.playerCount,
-            playerColors: room.gameState?.playerColors || {},
-            maxPlayers: room.maxPlayers || MAX_PLAYERS,
-            newHost: room.players[Object.keys(room.players)[0]]?.id
-          });
-          console.log(`${playerName} disconnected from room ${roomId} (${room.playerCount} players remaining)`);
-        }
-      }
+      const p = room?.players?.[socket.id];
+      if (!p) return;
+      p.connected = false;
+      p.disconnectedAt = new Date().toISOString();
+      io.to(roomId).emit('player_disconnected', {
+        playerId: socket.id,
+        playerName: p.name || 'Player',
+        players: room.players,
+        playerCount: room.playerCount,
+        playerColors: room.gameState?.playerColors || {},
+        maxPlayers: room.maxPlayers || MAX_PLAYERS
+      });
+      console.log(`${p.name || 'Player'} disconnected from room ${roomId}; waiting ${RECONNECT_GRACE_MS}ms for reconnect`);
     });
+
+    delete socketToPlayerUid[socket.id];
   });
 
   // Ping to keep connection alive
@@ -1189,6 +1249,21 @@ server.listen(PORT, () => {
 // Clean up empty rooms every hour
 setInterval(() => {
   const now = new Date();
+  // Expire disconnected players that didn't reconnect in time.
+  Object.keys(rooms).forEach(roomId => {
+    const room = rooms[roomId];
+    if (!room?.players) return;
+    Object.keys(room.players).forEach(socketId => {
+      const p = room.players[socketId];
+      if (!p?.connected && p?.disconnectedAt) {
+        const elapsed = now.getTime() - new Date(p.disconnectedAt).getTime();
+        if (elapsed > RECONNECT_GRACE_MS) {
+          removePlayerFromRoom(roomId, socketId, "disconnect_timeout");
+        }
+      }
+    });
+  });
+
   Object.keys(rooms).forEach(roomId => {
     const room = rooms[roomId];
     if (room.playerCount === 0) {
@@ -1201,3 +1276,5 @@ setInterval(() => {
     }
   });
 }, 60 * 60 * 1000); // Every hour
+
+
