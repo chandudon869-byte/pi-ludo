@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -11,9 +10,17 @@ app.use(express.json());
 // Serve static files from current directory
 app.use(express.static(__dirname));
 
-// Route for testing
+// Health route for backend-only deployments (e.g., frontend hosted on Netlify)
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.status(200).json({
+    ok: true,
+    service: 'ludo-server',
+    socketPath: '/socket.io'
+  });
+});
+
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
 const server = http.createServer(app);
