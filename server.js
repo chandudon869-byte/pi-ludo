@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const socketIo = require('socket.io');
 const cors = require('cors');
 
@@ -9,6 +10,60 @@ app.use(express.json());
 
 // Serve static files from current directory
 app.use(express.static(__dirname));
+
+function piApiRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.PI_SERVER_API_KEY;
+    if (!apiKey) {
+      reject(new Error('PI_SERVER_API_KEY not set'));
+      return;
+    }
+
+    const payload = body ? JSON.stringify(body) : null;
+    const req = https.request(
+      {
+        hostname: 'api.minepi.com',
+        path: `/v2${path}`,
+        method,
+        headers: {
+          Authorization: `Key ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Content-Length': payload ? Buffer.byteLength(payload) : 0
+        }
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (chunk) => {
+          raw += chunk;
+        });
+        res.on('end', () => {
+          let parsed = null;
+          try {
+            parsed = raw ? JSON.parse(raw) : null;
+          } catch (error) {
+            parsed = raw || null;
+          }
+
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+            return;
+          }
+
+          const err = new Error(`Pi API ${res.statusCode}`);
+          err.statusCode = res.statusCode;
+          err.body = parsed;
+          reject(err);
+        });
+      }
+    );
+
+    req.on('error', reject);
+    if (payload) {
+      req.write(payload);
+    }
+    req.end();
+  });
+}
 
 // Health route for backend-only deployments (e.g., frontend hosted on Netlify)
 app.get('/', (req, res) => {
@@ -21,6 +76,46 @@ app.get('/', (req, res) => {
 
 app.get('/healthz', (req, res) => {
   res.status(200).json({ ok: true });
+});
+
+app.post('/approve', async (req, res) => {
+  const { paymentId } = req.body || {};
+  if (!paymentId) {
+    res.status(400).json({ success: false, error: 'Missing paymentId' });
+    return;
+  }
+
+  try {
+    const payment = await piApiRequest('POST', `/payments/${paymentId}/approve`, null);
+    res.json({ success: true, payment });
+  } catch (error) {
+    console.error('Pi approve error:', error?.body || error?.message || error);
+    res.status(502).json({
+      success: false,
+      error: 'Pi approve failed',
+      details: error?.body || error?.message || 'Unknown error'
+    });
+  }
+});
+
+app.post('/complete', async (req, res) => {
+  const { paymentId, txid } = req.body || {};
+  if (!paymentId || !txid) {
+    res.status(400).json({ success: false, error: 'Missing paymentId or txid' });
+    return;
+  }
+
+  try {
+    const payment = await piApiRequest('POST', `/payments/${paymentId}/complete`, { txid });
+    res.json({ success: true, payment });
+  } catch (error) {
+    console.error('Pi complete error:', error?.body || error?.message || error);
+    res.status(502).json({
+      success: false,
+      error: 'Pi complete failed',
+      details: error?.body || error?.message || 'Unknown error'
+    });
+  }
 });
 
 const server = http.createServer(app);
