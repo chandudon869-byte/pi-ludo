@@ -368,7 +368,7 @@ function piApiRequest(method, path, body) {
         path: `/v2${path}`,
         method,
         headers: {
-          Authorization: `Key ${apiKey}`,
+          Authorization: `Key ${qol2cbk0whyrhhlkfx9lofnps2d6oxp6g4daofp5agy1bdp0ls5qi9ajourzqlly}`,
           'Content-Type': 'application/json',
           'Content-Length': payload ? Buffer.byteLength(payload) : 0
         }
