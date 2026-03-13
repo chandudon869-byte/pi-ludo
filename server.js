@@ -1,8 +1,12 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
@@ -10,6 +14,344 @@ app.use(express.json());
 
 // Serve static files from current directory
 app.use(express.static(__dirname));
+
+const COIN_ENTRY_FEE = parseInt(process.env.COIN_ENTRY_FEE || '10', 10);
+const COIN_HOUSE_FEE_PERCENT = parseInt(process.env.COIN_HOUSE_FEE_PERCENT || '10', 10);
+const COIN_STARTING_BALANCE = parseInt(process.env.COIN_STARTING_BALANCE || '500', 10);
+const COIN_DAILY_REWARD = parseInt(process.env.COIN_DAILY_REWARD || '50', 10);
+const COIN_ROOM_FEES = (process.env.COIN_ROOM_FEES || '10')
+  .split(',')
+  .map(v => parseInt(v.trim(), 10))
+  .filter(v => Number.isFinite(v) && v > 0);
+
+let mongoClient = null;
+let mongoDb = null;
+let playersCollection = null;
+let purchasesCollection = null;
+
+const COIN_PACKS = [
+  { id: 'pi-1', piAmount: 1, coins: 50 },
+  { id: 'pi-2', piAmount: 2, coins: 100 },
+  { id: 'pi-5', piAmount: 5, coins: 300 },
+  { id: 'pi-10', piAmount: 10, coins: 600 }
+];
+
+function getPackById(packId) {
+  return COIN_PACKS.find(pack => pack.id === packId) || null;
+}
+
+function createOrderId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return `order_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function initMongo() {
+  if (mongoDb && playersCollection && purchasesCollection) return;
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.warn('MONGODB_URI not set; coin system will be disabled.');
+    return;
+  }
+  mongoClient = mongoClient || new MongoClient(uri, { });
+  await mongoClient.connect();
+  mongoDb = mongoClient.db(process.env.MONGODB_DB || 'ludo');
+  playersCollection = mongoDb.collection('players');
+  purchasesCollection = mongoDb.collection('purchases');
+  await playersCollection.createIndex({ updatedAt: 1 });
+  await purchasesCollection.createIndex({ paymentId: 1 }, { unique: true, sparse: true });
+  await purchasesCollection.createIndex({ txid: 1 }, { unique: true, sparse: true });
+  await purchasesCollection.createIndex({ createdAt: 1 });
+  console.log('Connected to MongoDB for coin system.');
+}
+
+async function ensurePlayerDoc(playerUid) {
+  if (!playersCollection) return null;
+  await playersCollection.updateOne(
+    { _id: playerUid },
+    {
+      $setOnInsert: {
+        balance: COIN_STARTING_BALANCE,
+        createdAt: new Date(),
+        lastDailyClaim: null
+      },
+      $set: { updatedAt: new Date() }
+    },
+    { upsert: true }
+  );
+  return playersCollection.findOne({ _id: playerUid });
+}
+
+async function updatePlayerProfile(playerUid, name) {
+  if (!playersCollection || !playerUid) return;
+  if (!name) return;
+  await playersCollection.updateOne(
+    { _id: playerUid },
+    { $set: { name: String(name).slice(0, 24), updatedAt: new Date() } }
+  );
+}
+
+function getAllowedEntryFee(requested) {
+  const allowed = COIN_ROOM_FEES.length > 0 ? COIN_ROOM_FEES : [COIN_ENTRY_FEE];
+  if (allowed.includes(requested)) return requested;
+  if (allowed.includes(COIN_ENTRY_FEE)) return COIN_ENTRY_FEE;
+  return allowed[0];
+}
+
+async function getBalance(playerUid) {
+  if (!playersCollection) return null;
+  const doc = await ensurePlayerDoc(playerUid);
+  return doc?.balance ?? null;
+}
+
+async function debitBalance(playerUid, amount) {
+  if (!playersCollection) return { ok: false, disabled: true, reason: 'Coin system unavailable' };
+  await ensurePlayerDoc(playerUid);
+  const res = await playersCollection.findOneAndUpdate(
+    { _id: playerUid, balance: { $gte: amount } },
+    { $inc: { balance: -amount }, $set: { updatedAt: new Date() } },
+    { returnDocument: 'after' }
+  );
+  if (!res?.value) return { ok: false };
+  return { ok: true, balance: res.value.balance };
+}
+
+async function creditBalance(playerUid, amount) {
+  if (!playersCollection) return { ok: false, balance: null, disabled: true };
+  await ensurePlayerDoc(playerUid);
+  const res = await playersCollection.findOneAndUpdate(
+    { _id: playerUid },
+    { $inc: { balance: amount }, $set: { updatedAt: new Date() } },
+    { returnDocument: 'after' }
+  );
+  return { ok: true, balance: res?.value?.balance ?? null };
+}
+
+function getDailyInfo(doc) {
+  const last = doc?.lastDailyClaim ? new Date(doc.lastDailyClaim).getTime() : 0;
+  const now = Date.now();
+  const next = last ? last + 24 * 60 * 60 * 1000 : 0;
+  const canClaimDaily = !last || now >= next;
+  return {
+    canClaimDaily,
+    nextDailyClaimAt: canClaimDaily ? null : new Date(next).toISOString()
+  };
+}
+
+function initRoomCoins(room) {
+  if (!room) return;
+  if (!room.coin) {
+    room.coin = {
+      entryFee: COIN_ENTRY_FEE,
+      houseFeePercent: COIN_HOUSE_FEE_PERCENT,
+      pool: 0,
+      participants: {}
+    };
+  }
+}
+
+async function chargeEntryFee(room, socket, playerUid) {
+  initRoomCoins(room);
+  if (!playerUid) return { ok: false, reason: 'Missing player identity' };
+  if (room.coin.participants[playerUid]) {
+    return { ok: true, balance: await getBalance(playerUid) };
+  }
+  const res = await debitBalance(playerUid, room.coin.entryFee);
+  if (!res.ok) {
+    return { ok: false, reason: res.reason || 'Insufficient coins' };
+  }
+  room.coin.participants[playerUid] = true;
+  room.coin.pool += room.coin.entryFee;
+  if (socket) {
+    socket.emit('coins_updated', {
+      balance: res.balance,
+      entryFee: room.coin.entryFee,
+      houseFeePercent: room.coin.houseFeePercent
+    });
+  }
+  return { ok: true, balance: res.balance };
+}
+
+async function refundEntryFee(room, playerUid) {
+  if (!room?.coin || !room.coin.participants?.[playerUid]) return;
+  const amount = room.coin.entryFee;
+  delete room.coin.participants[playerUid];
+  room.coin.pool = Math.max(0, room.coin.pool - amount);
+  await creditBalance(playerUid, amount);
+}
+
+async function payOutWinner(room, winnerUid) {
+  if (!room?.coin || !winnerUid) return;
+  const pool = room.coin.pool || 0;
+  const feePct = room.coin.houseFeePercent || 0;
+  const fee = Math.max(0, Math.round(pool * (feePct / 100)));
+  const prize = Math.max(0, pool - fee);
+  if (prize > 0) {
+    await creditBalance(winnerUid, prize);
+  }
+  room.coin.pool = 0;
+  return { prize, fee };
+}
+
+async function emitCoinsUpdate(socketId, playerUid, room = null) {
+  if (!socketId || !playerUid) return;
+  const balance = await getBalance(playerUid);
+  io.to(socketId).emit('coins_updated', {
+    balance: balance ?? 0,
+    entryFee: room?.coin?.entryFee ?? COIN_ENTRY_FEE,
+    houseFeePercent: room?.coin?.houseFeePercent ?? COIN_HOUSE_FEE_PERCENT
+  });
+}
+
+app.get('/api/coins/balance', async (req, res) => {
+  try {
+    await initMongo();
+    const playerUid = String(req.query.playerUid || '').trim();
+    if (!playerUid) {
+      res.status(400).json({ error: 'Missing playerUid' });
+      return;
+    }
+    const doc = await ensurePlayerDoc(playerUid);
+    const balance = doc?.balance ?? 0;
+    const daily = getDailyInfo(doc);
+    res.json({
+      balance: balance ?? 0,
+      entryFee: COIN_ENTRY_FEE,
+      houseFeePercent: COIN_HOUSE_FEE_PERCENT,
+      canClaimDaily: daily.canClaimDaily,
+      nextDailyClaimAt: daily.nextDailyClaimAt
+    });
+  } catch (error) {
+    console.error('Balance error:', error);
+    res.status(500).json({ error: 'Failed to fetch balance' });
+  }
+});
+
+app.post('/api/coins/claim-daily', async (req, res) => {
+  try {
+    await initMongo();
+    const playerUid = String(req.body?.playerUid || '').trim();
+    if (!playerUid) {
+      res.status(400).json({ error: 'Missing playerUid' });
+      return;
+    }
+    const doc = await ensurePlayerDoc(playerUid);
+    const daily = getDailyInfo(doc);
+    if (!daily.canClaimDaily) {
+      res.json({
+        balance: doc?.balance ?? 0,
+        canClaimDaily: false,
+        nextDailyClaimAt: daily.nextDailyClaimAt
+      });
+      return;
+    }
+    const now = new Date();
+    const updated = await playersCollection.findOneAndUpdate(
+      { _id: playerUid },
+      {
+        $inc: { balance: COIN_DAILY_REWARD },
+        $set: { lastDailyClaim: now, updatedAt: now }
+      },
+      { returnDocument: 'after' }
+    );
+    const nextDaily = getDailyInfo(updated?.value);
+    res.json({
+      balance: updated?.value?.balance ?? 0,
+      canClaimDaily: nextDaily.canClaimDaily,
+      nextDailyClaimAt: nextDaily.nextDailyClaimAt
+    });
+  } catch (error) {
+    console.error('Claim daily error:', error);
+    res.status(500).json({ error: 'Failed to claim daily reward' });
+  }
+});
+
+app.get('/api/coins/leaderboard', async (req, res) => {
+  try {
+    await initMongo();
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit || '10', 10), 50));
+    const rows = await playersCollection
+      .find({}, { projection: { name: 1, balance: 1 } })
+      .sort({ balance: -1 })
+      .limit(limit)
+      .toArray();
+    res.json({
+      rows: rows.map(r => ({
+        name: r.name || 'Player',
+        balance: r.balance || 0
+      }))
+    });
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+  }
+});
+
+app.post('/api/players/profile', async (req, res) => {
+  try {
+    await initMongo();
+    const playerUid = String(req.body?.playerUid || '').trim();
+    const name = String(req.body?.name || '').trim();
+    if (!playerUid || !name) {
+      res.status(400).json({ error: 'Missing playerUid or name' });
+      return;
+    }
+    await updatePlayerProfile(playerUid, name);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+app.post('/api/coins/create-order', async (req, res) => {
+  try {
+    await initMongo();
+    if (!purchasesCollection) {
+      res.status(503).json({ error: 'Coin system unavailable' });
+      return;
+    }
+    const playerUid = String(req.body?.playerUid || '').trim();
+    const packId = String(req.body?.packId || '').trim();
+    if (!playerUid || !packId) {
+      res.status(400).json({ error: 'Missing playerUid or packId' });
+      return;
+    }
+    const pack = getPackById(packId);
+    if (!pack) {
+      res.status(400).json({ error: 'Invalid packId' });
+      return;
+    }
+    await ensurePlayerDoc(playerUid);
+    const orderId = createOrderId();
+    const now = new Date();
+    await purchasesCollection.insertOne({
+      _id: orderId,
+      playerUid,
+      packId: pack.id,
+      coins: pack.coins,
+      piAmount: pack.piAmount,
+      status: 'created',
+      createdAt: now,
+      updatedAt: now
+    });
+    res.json({
+      orderId,
+      packId: pack.id,
+      coins: pack.coins,
+      piAmount: pack.piAmount,
+      memo: `Ludo Coins +${pack.coins}`,
+      metadata: {
+        orderId,
+        packId: pack.id,
+        coins: pack.coins,
+        playerUid
+      }
+    });
+  } catch (error) {
+    console.error('Create order error:', error);
+    res.status(500).json({ error: 'Failed to create order' });
+  }
+});
 
 function piApiRequest(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -65,6 +407,24 @@ function piApiRequest(method, path, body) {
   });
 }
 
+function extractPaymentField(payment, key) {
+  if (!payment || typeof payment !== 'object') return undefined;
+  if (payment[key] !== undefined) return payment[key];
+  if (payment.payment && payment.payment[key] !== undefined) return payment.payment[key];
+  if (payment.data && payment.data[key] !== undefined) return payment.data[key];
+  return undefined;
+}
+
+function parseMetadata(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
 // Health route for backend-only deployments (e.g., frontend hosted on Netlify)
 app.get('/', (req, res) => {
   res.status(200).json({
@@ -78,16 +438,29 @@ app.get('/healthz', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-app.post('/approve', async (req, res) => {
-  const { paymentId } = req.body || {};
-  if (!paymentId) {
-    res.status(400).json({ success: false, error: 'Missing paymentId' });
+async function handlePaymentApprove(req, res) {
+  const { paymentId, orderId } = req.body || {};
+  if (!paymentId || !orderId) {
+    res.status(400).json({ success: false, error: 'Missing paymentId or orderId' });
     return;
   }
-
   try {
-    const payment = await piApiRequest('POST', `/payments/${paymentId}/approve`, null);
-    res.json({ success: true, payment });
+    await initMongo();
+    if (!purchasesCollection) {
+      res.status(503).json({ success: false, error: 'Coin system unavailable' });
+      return;
+    }
+    const order = await purchasesCollection.findOne({ _id: orderId });
+    if (!order) {
+      res.status(404).json({ success: false, error: 'Order not found' });
+      return;
+    }
+    await piApiRequest('POST', `/payments/${paymentId}/approve`, null);
+    await purchasesCollection.updateOne(
+      { _id: orderId },
+      { $set: { paymentId, status: 'approved', updatedAt: new Date() } }
+    );
+    res.json({ success: true });
   } catch (error) {
     console.error('Pi approve error:', error?.body || error?.message || error);
     res.status(502).json({
@@ -96,9 +469,9 @@ app.post('/approve', async (req, res) => {
       details: error?.body || error?.message || 'Unknown error'
     });
   }
-});
+}
 
-app.post('/complete', async (req, res) => {
+async function handlePaymentComplete(req, res) {
   const { paymentId, txid } = req.body || {};
   if (!paymentId || !txid) {
     res.status(400).json({ success: false, error: 'Missing paymentId or txid' });
@@ -106,8 +479,61 @@ app.post('/complete', async (req, res) => {
   }
 
   try {
-    const payment = await piApiRequest('POST', `/payments/${paymentId}/complete`, { txid });
-    res.json({ success: true, payment });
+    await initMongo();
+    if (!purchasesCollection) {
+      res.status(503).json({ success: false, error: 'Coin system unavailable' });
+      return;
+    }
+    const order = await purchasesCollection.findOne({ paymentId });
+    if (!order) {
+      res.status(404).json({ success: false, error: 'Order not found for payment' });
+      return;
+    }
+    if (order.status === 'completed') {
+      const balance = await getBalance(order.playerUid);
+      res.json({ success: true, balance });
+      return;
+    }
+
+    await piApiRequest('POST', `/payments/${paymentId}/complete`, { txid });
+
+    let paymentInfo = null;
+    try {
+      paymentInfo = await piApiRequest('GET', `/payments/${paymentId}`, null);
+    } catch (error) {
+      paymentInfo = null;
+    }
+
+    const paymentAmount = Number(extractPaymentField(paymentInfo, 'amount'));
+    const paymentMetadata = parseMetadata(extractPaymentField(paymentInfo, 'metadata'));
+    const metadataOk = paymentMetadata
+      && paymentMetadata.orderId === order._id
+      && paymentMetadata.packId === order.packId
+      && paymentMetadata.playerUid === order.playerUid
+      && Number(paymentMetadata.coins) === Number(order.coins);
+
+    if (!metadataOk || (Number.isFinite(paymentAmount) && paymentAmount !== Number(order.piAmount))) {
+      await purchasesCollection.updateOne(
+        { _id: order._id },
+        { $set: { status: 'mismatch', txid, updatedAt: new Date(), paymentInfo } }
+      );
+      res.status(400).json({ success: false, error: 'Payment metadata mismatch' });
+      return;
+    }
+
+    const credit = await creditBalance(order.playerUid, order.coins);
+    await purchasesCollection.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          status: 'completed',
+          txid,
+          updatedAt: new Date(),
+          paymentInfo
+        }
+      }
+    );
+    res.json({ success: true, balance: credit.balance });
   } catch (error) {
     console.error('Pi complete error:', error?.body || error?.message || error);
     res.status(502).json({
@@ -116,7 +542,12 @@ app.post('/complete', async (req, res) => {
       details: error?.body || error?.message || 'Unknown error'
     });
   }
-});
+}
+
+app.post('/approve', handlePaymentApprove);
+app.post('/complete', handlePaymentComplete);
+app.post('/api/payments/approve', handlePaymentApprove);
+app.post('/api/payments/complete', handlePaymentComplete);
 
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -134,10 +565,7 @@ const MAX_PLAYERS = 4;
 const DEFAULT_MAX_PLAYERS = 4;
 const TURN_TIME_MS = 10000;
 const RECONNECT_GRACE_MS = 60000;
-const quickPlayQueues = {
-  2: [],
-  4: []
-};
+const quickPlayQueues = {};
 const socketToPlayerUid = {};
 
 function replacePlayerIdInRoom(room, oldId, newId) {
@@ -175,6 +603,7 @@ function removePlayerFromRoom(roomId, playerId, reason = "left") {
   const leavingPlayer = room.players[playerId];
   const playerName = leavingPlayer?.name || "Player";
   const leavingWasHost = !!leavingPlayer?.isHost;
+  const playerUid = leavingPlayer?.playerUid || null;
 
   delete room.players[playerId];
   room.playerCount--;
@@ -218,13 +647,21 @@ function removePlayerFromRoom(roomId, playerId, reason = "left") {
     });
     console.log(`${playerName} removed from room ${roomId} (${room.playerCount} players remaining)`);
   }
+
+  if (!room?.gameState?.gameStarted && playerUid) {
+    refundEntryFee(room, playerUid).catch((err) => {
+      console.error('Refund error:', err);
+    });
+  }
 }
 
 function removeFromQuickPlayQueue(socketId) {
-  [2, 4].forEach(size => {
-    const idx = quickPlayQueues[size].indexOf(socketId);
+  Object.keys(quickPlayQueues).forEach(key => {
+    const queue = quickPlayQueues[key];
+    if (!Array.isArray(queue)) return;
+    const idx = queue.indexOf(socketId);
     if (idx !== -1) {
-      quickPlayQueues[size].splice(idx, 1);
+      queue.splice(idx, 1);
     }
   });
 }
@@ -253,10 +690,11 @@ function findRoomPlayerByUid(playerUid, preferredRoomId = null) {
   return null;
 }
 
-function emitQuickPlayQueueUpdate(queueSize) {
-  const queue = quickPlayQueues[queueSize] || [];
-  const payload = { count: queue.length, maxPlayers: queueSize };
-  console.log(`[QP] Queue ${queueSize}: ${queue.length} waiting`);
+function emitQuickPlayQueueUpdate(queueSize, entryFee) {
+  const key = `${queueSize}_${entryFee}`;
+  const queue = quickPlayQueues[key] || [];
+  const payload = { count: queue.length, maxPlayers: queueSize, entryFee };
+  console.log(`[QP] Queue ${queueSize} fee ${entryFee}: ${queue.length} waiting`);
   queue.forEach(id => {
     const s = io.sockets.sockets.get(id);
     if (s) {
@@ -265,10 +703,12 @@ function emitQuickPlayQueueUpdate(queueSize) {
   });
 }
 
-function createQuickPlayRoom(queueSize) {
+async function createQuickPlayRoom(queueSize, entryFee) {
   const size = [2, 4].includes(queueSize) ? queueSize : DEFAULT_MAX_PLAYERS;
-  const queue = quickPlayQueues[size] || [];
-  console.log(`[QP] Attempting match for ${size}. Queue size: ${queue.length}`);
+  const fee = getAllowedEntryFee(entryFee);
+  const key = `${size}_${fee}`;
+  const queue = quickPlayQueues[key] || [];
+  console.log(`[QP] Attempting match for ${size} fee ${fee}. Queue size: ${queue.length}`);
   const playersToMatch = [];
   while (playersToMatch.length < size && queue.length > 0) {
     const id = queue.shift();
@@ -281,7 +721,45 @@ function createQuickPlayRoom(queueSize) {
   if (playersToMatch.length < size) {
     // Not enough valid sockets, put them back and update queue
     playersToMatch.forEach(s => queue.unshift(s.id));
-    emitQuickPlayQueueUpdate(size);
+    emitQuickPlayQueueUpdate(size, fee);
+    return;
+  }
+
+  await initMongo();
+  const paidSockets = [];
+  for (const s of playersToMatch) {
+    const playerUid = getSocketPlayerUid(s, s.data || {});
+    if (!playerUid) {
+      s.emit('error', { message: 'Missing player identity for coins.' });
+      continue;
+    }
+    const debit = await debitBalance(playerUid, fee);
+    if (!debit.ok) {
+      const message = debit.disabled
+        ? 'Coin system unavailable. Try again later.'
+        : `Not enough coins. Entry fee is ${fee}.`;
+      s.emit('error', { message });
+      continue;
+    }
+    s.emit('coins_updated', {
+      balance: debit.balance,
+      entryFee: fee,
+      houseFeePercent: COIN_HOUSE_FEE_PERCENT
+    });
+    paidSockets.push({ socket: s, playerUid });
+  }
+
+  if (paidSockets.length < size) {
+    for (const paid of paidSockets) {
+      await creditBalance(paid.playerUid, fee);
+      paid.socket.emit('coins_updated', {
+        balance: await getBalance(paid.playerUid),
+        entryFee: fee,
+        houseFeePercent: COIN_HOUSE_FEE_PERCENT
+      });
+      queue.unshift(paid.socket.id);
+    }
+    emitQuickPlayQueueUpdate(size, fee);
     return;
   }
 
@@ -292,6 +770,12 @@ function createQuickPlayRoom(queueSize) {
     playerCount: 0,
     maxPlayers: size,
     isPublic: false,
+    coin: {
+      entryFee: fee,
+      houseFeePercent: COIN_HOUSE_FEE_PERCENT,
+      pool: fee * paidSockets.length,
+      participants: {}
+    },
     gameState: {
       players: {},
       playerColors: {},
@@ -309,13 +793,15 @@ function createQuickPlayRoom(queueSize) {
     createdAt: new Date().toISOString()
   };
 
-  playersToMatch.forEach((s, idx) => {
+  paidSockets.forEach((entry, idx) => {
+    const s = entry.socket;
     const isHost = idx === 0;
     const name = s.data?.playerName || `Player${Object.keys(rooms[roomId].players).length + 1}`;
     const avatar = s.data?.playerAvatar || null;
+    rooms[roomId].coin.participants[entry.playerUid] = true;
     rooms[roomId].players[s.id] = {
       id: s.id,
-      playerUid: s.data?.playerUid || socketToPlayerUid[s.id] || null,
+      playerUid: entry.playerUid || s.data?.playerUid || socketToPlayerUid[s.id] || null,
       name,
       avatar,
       isHost,
@@ -338,7 +824,8 @@ function createQuickPlayRoom(queueSize) {
     isPublic: rooms[roomId].isPublic
   };
 
-  playersToMatch.forEach((s, idx) => {
+  paidSockets.forEach((entry, idx) => {
+    const s = entry.socket;
     if (idx === 0) {
       s.emit('room_created', { ...payload, isHost: true });
     } else {
@@ -346,7 +833,7 @@ function createQuickPlayRoom(queueSize) {
     }
   });
 
-  emitQuickPlayQueueUpdate(size);
+  emitQuickPlayQueueUpdate(size, fee);
 }
 
 function clearTurnTimer(room) {
@@ -439,7 +926,7 @@ function passTurn(roomId, playerColor) {
   startTurnTimer(roomId);
 }
 
-function applyMove(roomId, color, tokenIndex, diceValue, actorId) {
+async function applyMove(roomId, color, tokenIndex, diceValue, actorId) {
   const room = rooms[roomId];
   if (!room || !room.gameState?.gameStarted) return;
 
@@ -530,11 +1017,19 @@ function applyMove(roomId, color, tokenIndex, diceValue, actorId) {
 
   if (winner) {
     clearTurnTimer(room);
+    const winnerPlayerId = room.gameState.playerColors[winner];
+    const winnerUid = room.players[winnerPlayerId]?.playerUid || null;
+    const payout = await payOutWinner(room, winnerUid);
+    if (winnerPlayerId && winnerUid) {
+      await emitCoinsUpdate(winnerPlayerId, winnerUid, room);
+    }
     setTimeout(() => {
       io.to(roomId).emit('game_over', {
         winner: winner,
         winnerName: room.players[actorId]?.name || 'Player',
-        winnerColor: winner
+        winnerColor: winner,
+        prize: payout?.prize ?? 0,
+        fee: payout?.fee ?? 0
       });
       console.log(`Game over in room ${roomId}. Winner: ${winner}`);
     }, 1000);
@@ -551,7 +1046,8 @@ function buildPublicRoomsList() {
         hostName: host?.name || 'Host',
         playerCount: room.playerCount || 0,
         maxPlayers: room.maxPlayers || MAX_PLAYERS,
-        gameStarted: !!room.gameState?.gameStarted
+        gameStarted: !!room.gameState?.gameStarted,
+        entryFee: room.coin?.entryFee || COIN_ENTRY_FEE
       };
     });
 }
@@ -591,7 +1087,7 @@ io.on('connection', (socket) => {
     socketToPlayerUid[socket.id] = authPlayerUid;
   }
 
-  socket.on('reconnect_player', (data = {}) => {
+  socket.on('reconnect_player', async (data = {}) => {
     try {
       const playerUid = getSocketPlayerUid(socket, data);
       const roomId = (data.roomId || '').toUpperCase();
@@ -599,6 +1095,8 @@ io.on('connection', (socket) => {
         socket.emit('reconnect_failed', { message: 'Missing reconnect identity' });
         return;
       }
+
+      await initMongo();
 
       const found = findRoomPlayerByUid(playerUid, roomId);
       if (!found) {
@@ -658,6 +1156,10 @@ io.on('connection', (socket) => {
         }
       });
 
+      emitCoinsUpdate(socket.id, playerUid, room).catch((err) => {
+        console.error('Coins update error:', err);
+      });
+
       socket.to(roomId).emit('player_reconnected', {
         playerId: socket.id,
         players: room.players,
@@ -672,11 +1174,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('quick_play_join', (data = {}) => {
+  socket.on('quick_play_join', async (data = {}) => {
     const playerName = data.playerName || `Player${Math.floor(Math.random() * 1000)}`;
     const maxPlayers = [2, 4].includes(parseInt(data.maxPlayers, 10)) ? parseInt(data.maxPlayers, 10) : DEFAULT_MAX_PLAYERS;
     const avatar = data.avatar || null;
     const playerUid = getSocketPlayerUid(socket, data);
+    const requestedFee = parseInt(data.entryFee, 10);
+    const entryFee = getAllowedEntryFee(Number.isFinite(requestedFee) ? requestedFee : COIN_ENTRY_FEE);
     socket.data = socket.data || {};
     socket.data.playerName = playerName;
     socket.data.playerAvatar = avatar;
@@ -686,22 +1190,28 @@ io.on('connection', (socket) => {
     }
 
     removeFromQuickPlayQueue(socket.id);
-    const queue = quickPlayQueues[maxPlayers];
-    if (queue && !queue.includes(socket.id)) {
+    await initMongo();
+    await updatePlayerProfile(playerUid, playerName);
+
+    const key = `${maxPlayers}_${entryFee}`;
+    const queue = quickPlayQueues[key] || (quickPlayQueues[key] = []);
+    if (!queue.includes(socket.id)) {
       queue.push(socket.id);
     }
 
-    console.log(`[QP] ${playerName} (${socket.id}) joined queue ${maxPlayers}. Now ${queue?.length || 0}`);
-    emitQuickPlayQueueUpdate(maxPlayers);
+    console.log(`[QP] ${playerName} (${socket.id}) joined queue ${maxPlayers} fee ${entryFee}. Now ${queue?.length || 0}`);
+    emitQuickPlayQueueUpdate(maxPlayers, entryFee);
     if (queue.length >= maxPlayers) {
-      createQuickPlayRoom(maxPlayers);
+      createQuickPlayRoom(maxPlayers, entryFee);
     }
   });
 
   socket.on('quick_play_cancel', () => {
     removeFromQuickPlayQueue(socket.id);
-    emitQuickPlayQueueUpdate(2);
-    emitQuickPlayQueueUpdate(4);
+    COIN_ROOM_FEES.forEach(fee => {
+      emitQuickPlayQueueUpdate(2, fee);
+      emitQuickPlayQueueUpdate(4, fee);
+    });
   });
 
   socket.on('no_move_possible', (data) => {
@@ -730,7 +1240,7 @@ io.on('connection', (socket) => {
     passTurn(roomId, playerColor);
   });
   // Create a new room
-  socket.on('create_room', (data) => {
+  socket.on('create_room', async (data) => {
     try {
       const { playerName, isPublic, avatar } = data;
       const playerUid = getSocketPlayerUid(socket, data);
@@ -739,6 +1249,28 @@ io.on('connection', (socket) => {
         socket.data.playerUid = playerUid;
         socketToPlayerUid[socket.id] = playerUid;
       }
+      await initMongo();
+      await updatePlayerProfile(playerUid, playerName);
+      if (!playerUid) {
+        socket.emit('error', { message: 'Missing player identity for coins.' });
+        return;
+      }
+
+      const requestedFee = parseInt(data.entryFee, 10);
+      const entryFee = getAllowedEntryFee(Number.isFinite(requestedFee) ? requestedFee : COIN_ENTRY_FEE);
+      const debit = await debitBalance(playerUid, entryFee);
+      if (!debit.ok) {
+        const message = debit.disabled
+          ? 'Coin system unavailable. Try again later.'
+          : `Not enough coins. Entry fee is ${entryFee}.`;
+        socket.emit('error', { message });
+        return;
+      }
+      socket.emit('coins_updated', {
+        balance: debit.balance,
+        entryFee: entryFee,
+        houseFeePercent: COIN_HOUSE_FEE_PERCENT
+      });
       const roomId = generateRoomCode();
       
       rooms[roomId] = {
@@ -759,6 +1291,14 @@ io.on('connection', (socket) => {
         playerCount: 1,
         maxPlayers: DEFAULT_MAX_PLAYERS,
         isPublic: !!isPublic,
+        coin: {
+          entryFee: entryFee,
+          houseFeePercent: COIN_HOUSE_FEE_PERCENT,
+          pool: entryFee,
+          participants: {
+            [playerUid]: true
+          }
+        },
         gameState: {
           players: {},
           playerColors: {},
@@ -804,7 +1344,7 @@ io.on('connection', (socket) => {
   });
 
   // Join an existing room
-  socket.on('join_room', (data) => {
+  socket.on('join_room', async (data) => {
     try {
       const { roomId, playerName, avatar } = data;
       const playerUid = getSocketPlayerUid(socket, data);
@@ -821,6 +1361,13 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: 'Room not found. Check the code!' });
         return;
       }
+
+      await initMongo();
+      await updatePlayerProfile(playerUid, playerName);
+      if (!playerUid) {
+        socket.emit('error', { message: 'Missing player identity for coins.' });
+        return;
+      }
       
       const roomMax = rooms[roomCode].maxPlayers || MAX_PLAYERS;
       if (rooms[roomCode].playerCount >= roomMax) {
@@ -831,6 +1378,12 @@ io.on('connection', (socket) => {
       // Check if player already in room
       if (rooms[roomCode].players[socket.id]) {
         socket.emit('error', { message: 'You are already in this room' });
+        return;
+      }
+
+      const debit = await chargeEntryFee(rooms[roomCode], socket, playerUid);
+      if (!debit.ok) {
+        socket.emit('error', { message: debit.reason || `Not enough coins. Entry fee is ${COIN_ENTRY_FEE}.` });
         return;
       }
       
@@ -1257,7 +1810,7 @@ io.on('connection', (socket) => {
   });
 
   // Move token
-  socket.on('move_token', (data) => {
+  socket.on('move_token', async (data) => {
     try {
       const { roomId, color, tokenIndex, diceValue } = data;
       const room = rooms[roomId];
@@ -1279,7 +1832,7 @@ io.on('connection', (socket) => {
         return;
       }
       
-      applyMove(roomId, color, tokenIndex, diceValue, socket.id);
+      await applyMove(roomId, color, tokenIndex, diceValue, socket.id);
       console.log(`${room.players[socket.id]?.name} moved ${color} token ${tokenIndex}`);
     } catch (error) {
       console.error('Error moving token:', error);
@@ -1303,8 +1856,10 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
     removeFromQuickPlayQueue(socket.id);
-    emitQuickPlayQueueUpdate(2);
-    emitQuickPlayQueueUpdate(4);
+    COIN_ROOM_FEES.forEach(fee => {
+      emitQuickPlayQueueUpdate(2, fee);
+      emitQuickPlayQueueUpdate(4, fee);
+    });
 
     // Mark disconnected; keep room spot for grace period.
     Object.keys(rooms).forEach(roomId => {
@@ -1335,6 +1890,9 @@ io.on('connection', (socket) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
+initMongo().catch((err) => {
+  console.error('Mongo init failed:', err);
+});
 server.listen(PORT, () => {
   console.log(`✅ Ludo Server running on port ${PORT}`);
   console.log(`📱 Access at: http://localhost:${PORT}`);
