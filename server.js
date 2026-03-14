@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+const apiKey = process.env.PI_SERVER_API_KEY;
+const mongoUri = process.env.MONGODB_URI;
+
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -47,12 +50,11 @@ function createOrderId() {
 
 async function initMongo() {
   if (mongoDb && playersCollection && purchasesCollection) return;
-  const uri = process.env.MONGODB_URI;
-  if (!uri) {
+  if (!mongoUri) {
     console.warn('MONGODB_URI not set; coin system will be disabled.');
     return;
   }
-  mongoClient = mongoClient || new MongoClient(uri, { });
+  mongoClient = mongoClient || new MongoClient(mongoUri, { });
   await mongoClient.connect();
   mongoDb = mongoClient.db(process.env.MONGODB_DB || 'ludo');
   playersCollection = mongoDb.collection('players');
@@ -355,7 +357,6 @@ app.post('/api/coins/create-order', async (req, res) => {
 
 function piApiRequest(method, path, body) {
   return new Promise((resolve, reject) => {
-    const apiKey = process.env.PI_SERVER_API_KEY;
     if (!apiKey) {
       reject(new Error('PI_SERVER_API_KEY not set'));
       return;
