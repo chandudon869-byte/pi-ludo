@@ -21,6 +21,7 @@ app.use(express.static(__dirname));
 const COIN_ENTRY_FEE = parseInt(process.env.COIN_ENTRY_FEE || '10', 10);
 const COIN_HOUSE_FEE_PERCENT = parseInt(process.env.COIN_HOUSE_FEE_PERCENT || '10', 10);
 const COIN_STARTING_BALANCE = parseInt(process.env.COIN_STARTING_BALANCE || '500', 10);
+const COIN_NEW_PLAYER_BONUS = parseInt(process.env.COIN_NEW_PLAYER_BONUS || '100', 10);
 const COIN_DAILY_REWARD = parseInt(process.env.COIN_DAILY_REWARD || '50', 10);
 const COIN_ROOM_FEES = (process.env.COIN_ROOM_FEES || '10')
   .split(',')
@@ -72,9 +73,11 @@ async function ensurePlayerDoc(playerUid) {
     { _id: playerUid },
     {
       $setOnInsert: {
-        balance: COIN_STARTING_BALANCE,
+        balance: COIN_STARTING_BALANCE + COIN_NEW_PLAYER_BONUS,
         createdAt: new Date(),
-        lastDailyClaim: null
+        lastDailyClaim: null,
+        dailyStreak: 0,
+        bonusGranted: true
       },
       $set: { updatedAt: new Date() }
     },
@@ -133,9 +136,18 @@ function getDailyInfo(doc) {
   const now = Date.now();
   const next = last ? last + 24 * 60 * 60 * 1000 : 0;
   const canClaimDaily = !last || now >= next;
+  const streak = Math.max(0, parseInt(doc?.dailyStreak || 0, 10) || 0);
+  const nextStreak = canClaimDaily
+    ? (last && now - last <= 48 * 60 * 60 * 1000 ? streak + 1 : 1)
+    : streak;
+  const nextDay = ((nextStreak - 1) % 7) + 1;
+  const nextRewardAmount = 100 + (nextDay - 1) * 50;
   return {
     canClaimDaily,
-    nextDailyClaimAt: canClaimDaily ? null : new Date(next).toISOString()
+    nextDailyClaimAt: canClaimDaily ? null : new Date(next).toISOString(),
+    dailyStreak: streak,
+    nextRewardDay: nextDay,
+    nextRewardAmount
   };
 }
 
@@ -171,6 +183,45 @@ async function chargeEntryFee(room, socket, playerUid) {
     });
   }
   return { ok: true, balance: res.balance };
+}
+
+async function chargeEntryFeesForMatch(room, socketsById) {
+  initRoomCoins(room);
+  if (!room?.isPublic) {
+    return { ok: true };
+  }
+  if (!playersCollection) {
+    return { ok: false, reason: 'Coin system unavailable' };
+  }
+
+  const playerEntries = Object.values(room.players || {})
+    .map(p => ({ id: p.id, playerUid: p.playerUid, name: p.name || 'Player' }))
+    .filter(p => p.playerUid);
+
+  for (const p of playerEntries) {
+    const balance = await getBalance(p.playerUid);
+    if (balance === null || balance < room.coin.entryFee) {
+      return {
+        ok: false,
+        reason: `${p.name} has ${balance ?? 0} coins; entry fee is ${room.coin.entryFee}.`
+      };
+    }
+  }
+
+  const debited = [];
+  for (const p of playerEntries) {
+    const socket = socketsById.get(p.id) || null;
+    const res = await chargeEntryFee(room, socket, p.playerUid);
+    if (!res.ok) {
+      for (const uid of debited) {
+        await creditBalance(uid, room.coin.entryFee);
+      }
+      return { ok: false, reason: res.reason || 'Failed to deduct entry fee' };
+    }
+    debited.push(p.playerUid);
+  }
+
+  return { ok: true };
 }
 
 async function refundEntryFee(room, playerUid) {
@@ -220,7 +271,10 @@ app.get('/api/coins/balance', async (req, res) => {
       entryFee: COIN_ENTRY_FEE,
       houseFeePercent: COIN_HOUSE_FEE_PERCENT,
       canClaimDaily: daily.canClaimDaily,
-      nextDailyClaimAt: daily.nextDailyClaimAt
+      nextDailyClaimAt: daily.nextDailyClaimAt,
+      dailyStreak: daily.dailyStreak,
+      nextRewardDay: daily.nextRewardDay,
+      nextRewardAmount: daily.nextRewardAmount
     });
   } catch (error) {
     console.error('Balance error:', error);
@@ -242,16 +296,25 @@ app.post('/api/coins/claim-daily', async (req, res) => {
       res.json({
         balance: doc?.balance ?? 0,
         canClaimDaily: false,
-        nextDailyClaimAt: daily.nextDailyClaimAt
+        nextDailyClaimAt: daily.nextDailyClaimAt,
+        dailyStreak: daily.dailyStreak,
+        nextRewardDay: daily.nextRewardDay,
+        nextRewardAmount: daily.nextRewardAmount
       });
       return;
     }
     const now = new Date();
+    const last = doc?.lastDailyClaim ? new Date(doc.lastDailyClaim).getTime() : 0;
+    const streak = Math.max(0, parseInt(doc?.dailyStreak || 0, 10) || 0);
+    const continueStreak = last && (now.getTime() - last) <= 48 * 60 * 60 * 1000;
+    const nextStreak = continueStreak ? streak + 1 : 1;
+    const rewardDay = ((nextStreak - 1) % 7) + 1;
+    const rewardAmount = 100 + (rewardDay - 1) * 50;
     const updated = await playersCollection.findOneAndUpdate(
       { _id: playerUid },
       {
-        $inc: { balance: COIN_DAILY_REWARD },
-        $set: { lastDailyClaim: now, updatedAt: now }
+        $inc: { balance: rewardAmount },
+        $set: { lastDailyClaim: now, dailyStreak: nextStreak, updatedAt: now }
       },
       { returnDocument: 'after' }
     );
@@ -259,7 +322,12 @@ app.post('/api/coins/claim-daily', async (req, res) => {
     res.json({
       balance: updated?.value?.balance ?? 0,
       canClaimDaily: nextDaily.canClaimDaily,
-      nextDailyClaimAt: nextDaily.nextDailyClaimAt
+      nextDailyClaimAt: nextDaily.nextDailyClaimAt,
+      dailyStreak: nextDaily.dailyStreak,
+      nextRewardDay: nextDaily.nextRewardDay,
+      nextRewardAmount: nextDaily.nextRewardAmount,
+      rewardGranted: rewardAmount,
+      rewardDay
     });
   } catch (error) {
     console.error('Claim daily error:', error);
@@ -727,6 +795,77 @@ async function createQuickPlayRoom(queueSize, entryFee) {
   }
 
   await initMongo();
+  if (!playersCollection) {
+    const roomId = generateRoomCode();
+    console.log(`[QP] Coin system disabled; creating room ${roomId} without entry fee`);
+    rooms[roomId] = {
+      players: {},
+      playerCount: 0,
+      maxPlayers: size,
+      isPublic: false,
+      coin: {
+        entryFee: 0,
+        houseFeePercent: COIN_HOUSE_FEE_PERCENT,
+        pool: 0,
+        participants: {}
+      },
+      gameState: {
+        players: {},
+        playerColors: {},
+        currentPlayer: null,
+        diceValue: 0,
+        gameStarted: false,
+        settings: {},
+        tokens: {
+          r: [-1, -1, -1, -1],
+          g: [-1, -1, -1, -1],
+          y: [-1, -1, -1, -1],
+          b: [-1, -1, -1, -1]
+        }
+      },
+      createdAt: new Date().toISOString()
+    };
+
+    const payload = {
+      roomId,
+      players: rooms[roomId].players,
+      playerCount: rooms[roomId].playerCount,
+      maxPlayers: rooms[roomId].maxPlayers,
+      isPublic: rooms[roomId].isPublic
+    };
+
+    playersToMatch.forEach((s, idx) => {
+      const isHost = idx === 0;
+      const name = s.data?.playerName || `Player${Object.keys(rooms[roomId].players).length + 1}`;
+      const avatar = s.data?.playerAvatar || null;
+      rooms[roomId].players[s.id] = {
+        id: s.id,
+        playerUid: getSocketPlayerUid(s, s.data || {}) || s.data?.playerUid || socketToPlayerUid[s.id] || null,
+        name,
+        avatar,
+        isHost,
+        ready: true,
+        color: null,
+        connected: true,
+        disconnectedAt: null,
+        joinedAt: new Date().toISOString()
+      };
+      rooms[roomId].playerCount++;
+      rooms[roomId].gameState.players[s.id] = { name, ready: true };
+      s.join(roomId);
+    });
+
+    playersToMatch.forEach((s, idx) => {
+      if (idx === 0) {
+        s.emit('room_created', { ...payload, isHost: true });
+      } else {
+        s.emit('room_joined', { ...payload, isHost: false });
+      }
+    });
+
+    emitQuickPlayQueueUpdate(size, fee);
+    return;
+  }
   const paidSockets = [];
   for (const s of playersToMatch) {
     const playerUid = getSocketPlayerUid(s, s.data || {});
@@ -1194,6 +1333,19 @@ io.on('connection', (socket) => {
     await initMongo();
     await updatePlayerProfile(playerUid, playerName);
 
+    if (!playerUid) {
+      socket.emit('error', { message: 'Missing player identity for coins.' });
+      return;
+    }
+
+    if (playersCollection) {
+      const balance = await getBalance(playerUid);
+      if (balance === null || balance < entryFee) {
+        socket.emit('error', { message: `Not enough coins. Entry fee is ${entryFee}.` });
+        return;
+      }
+    }
+
     const key = `${maxPlayers}_${entryFee}`;
     const queue = quickPlayQueues[key] || (quickPlayQueues[key] = []);
     if (!queue.includes(socket.id)) {
@@ -1382,12 +1534,18 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const debit = await chargeEntryFee(rooms[roomCode], socket, playerUid);
-      if (!debit.ok) {
-        socket.emit('error', { message: debit.reason || `Not enough coins. Entry fee is ${COIN_ENTRY_FEE}.` });
-        return;
+      initRoomCoins(rooms[roomCode]);
+      if (rooms[roomCode]?.coin?.entryFee > 0) {
+        const charge = await chargeEntryFee(rooms[roomCode], socket, playerUid);
+        if (!charge.ok) {
+          const message = charge.reason?.includes('unavailable')
+            ? 'Coin system unavailable. Try again later.'
+            : `Not enough coins. Entry fee is ${rooms[roomCode].coin.entryFee}.`;
+          socket.emit('error', { message });
+          return;
+        }
       }
-      
+
       // Add player to room
       rooms[roomCode].players[socket.id] = {
         id: socket.id,
@@ -1619,7 +1777,7 @@ io.on('connection', (socket) => {
   });
 
   // Start game
-  socket.on('start_game', (data) => {
+  socket.on('start_game', async (data) => {
     try {
       const { roomId, settings } = data;
       const room = rooms[roomId];
@@ -1639,6 +1797,13 @@ io.on('connection', (socket) => {
       // Ensure at least 2 players
       if (room.playerCount < 2) {
         socket.emit('error', { message: 'Need at least 2 players to start' });
+        return;
+      }
+
+      await initMongo();
+      const matchCharge = await chargeEntryFeesForMatch(room, io.sockets.sockets);
+      if (!matchCharge.ok) {
+        socket.emit('error', { message: matchCharge.reason || `Not enough coins. Entry fee is ${COIN_ENTRY_FEE}.` });
         return;
       }
 
@@ -1714,7 +1879,7 @@ io.on('connection', (socket) => {
   });
 
   // Restart game (host only)
-  socket.on('restart_game', (data) => {
+  socket.on('restart_game', async (data) => {
     try {
       const { roomId } = data;
       const room = rooms[roomId];
@@ -1733,6 +1898,13 @@ io.on('connection', (socket) => {
       const selectedColors = Object.keys(room.gameState.playerColors);
       if (selectedColors.length < 2) {
         socket.emit('error', { message: 'Need at least 2 players to restart' });
+        return;
+      }
+
+      await initMongo();
+      const matchCharge = await chargeEntryFeesForMatch(room, io.sockets.sockets);
+      if (!matchCharge.ok) {
+        socket.emit('error', { message: matchCharge.reason || `Not enough coins. Entry fee is ${COIN_ENTRY_FEE}.` });
         return;
       }
 
